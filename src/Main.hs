@@ -4,7 +4,9 @@ import Reactive.Banana
 import Reactive.Banana.Frameworks hiding
     ( register )
 import Prelude hiding
-    ( mapM_ )
+    ( mapM_
+    , foldl
+    )
 import Control.Monad hiding
     ( mapM_ )
 import Network.Socket
@@ -13,6 +15,9 @@ import qualified Control.Event.Handler as Handler
 import Control.Exception
 import Control.Concurrent
 import Data.Maybe (isJust)
+import Text.Parsec.Char
+import Text.Parsec
+import Data.Monoid
 
 newtype SentMessage = SentMessage (Integer, String)
 
@@ -21,6 +26,11 @@ newtype Client = Client (Integer, Socket)
 newtype EvHandler a = EvHandler (Handler.AddHandler a, Handler.Handler a)
 
 newtype TextMessage = TextMessage String
+
+data Cmd = CmdQuit
+         | CmdHelp
+         | CmdBroadcast String
+         | CmdError
 
 -- | This class modells data that is associated with a user.
 class User a where
@@ -74,6 +84,94 @@ class EventSource a where
 instance EventSource EvHandler where
     getEvents (EvHandler (addHandler,_)) =
         fromAddHandler addHandler
+
+class ChatCommand a where
+    isQuit :: a -> Bool
+    getBroadcastMessage :: a -> Maybe String
+    getDirectionalMessage :: a -> Maybe (Integer, String)
+    isHelp :: a -> Bool
+    isError :: a -> Bool
+
+instance ChatCommand Cmd where
+    isQuit CmdQuit = True
+    isQuit _ = False
+    getBroadcastMessage (CmdBroadcast s) = Just s
+    getBroadcastMessage _ = Nothing
+    getDirectionalMessage _ = Nothing
+    isHelp CmdHelp = True
+    isHelp _ = False
+    isError CmdError = True
+    isError _ = False
+
+instance ChatCommand TextMessage where
+    getBroadcastMessage (TextMessage s) = getBroadcastMessage $ parseCmd s
+    getDirectionalMessage (TextMessage s) = getDirectionalMessage $ parseCmd s
+    isHelp (TextMessage s) = isHelp $ parseCmd s
+    isError (TextMessage s) = isError $ parseCmd s
+    isQuit (TextMessage s) = isQuit $ parseCmd s
+
+instance ChatCommand SentMessage where
+    getBroadcastMessage (SentMessage (_,s)) = getBroadcastMessage $ parseCmd s
+    getDirectionalMessage (SentMessage (_,s)) = getDirectionalMessage $ parseCmd s
+    isHelp (SentMessage (_,s)) = isHelp $ parseCmd s
+    isError (SentMessage (_,s)) = isError $ parseCmd s
+    isQuit (SentMessage (_,s)) = isQuit $ parseCmd s
+
+parseCmd :: String -> Cmd
+parseCmd text =
+    case parse ( do res <-eventually command `alternative` broadcast
+                    _ <- Text.Parsec.many anyChar
+                    return res
+               ) "" text of
+      Left _ -> CmdError
+      Right x -> x
+    where
+      alternative = (Text.Parsec.<|>)
+      eventually = Text.Parsec.try
+      broadcast = do CmdBroadcast <$> Text.Parsec.many anyChar
+      command = do _ <- char '/'
+                   eventually quit `alternative` help
+      help = string "help" >> return CmdHelp
+      quit = string "quit" >> return CmdQuit
+
+helpText :: String
+helpText =
+    unlines [ "Help:"
+            , "\t/help: Show this message"
+            , "\t/quit: Quit this program"
+            ]
+
+-- | Execute the corresponding io action to a chat command.
+execChatCommand :: (ChatCommand c, User c, User u, NetworkTarget u, Foldable f) =>
+                   f u -> c -> IO ()
+execChatCommand users chatCmd = do
+  when (isHelp chatCmd) (sendMessage messageSock (TextMessage $ helpText))
+  when (isQuit chatCmd) (do close messageSock
+                            putStrLn $ "User "++show (userId chatCmd)++" disconnected"
+                        )
+  case getBroadcastMessage chatCmd of
+    Nothing -> return ()
+    Just s -> broadcastMessage sendMessage users (SentMessage (userId chatCmd,s))
+  where messageSock =
+            maybe
+            (error "execChatCommand: cannot associate message with any user")
+            targetSocket
+            (find (\x -> userId x == userId chatCmd) users)
+
+-- | Delete a user from the userlist when they disconnect.
+handleQuit :: ( ChatCommand c, User c
+              , User u, NetworkTarget u
+              , Foldable f, Monoid (f u), Applicative f) =>
+              f u -> c -> f u
+handleQuit users cmd
+    | isQuit cmd =
+        foldl
+        (\accu user -> if userId user /= userId cmd
+                       then accu <> pure user
+                       else accu)
+        mempty
+        users
+    | otherwise = users
 
 -- | Broadcast a message to every user except the "owner" of the
 -- message.  This method calls asynchronous threads.
@@ -160,8 +258,8 @@ main = do
                                               ]
                                      )
                    userAdd = (:) <$> newUser
-                   userQuit = never
-                   newUser = getId ((\sock uid -> Client (uid,sock)) <$> newConnections)
+                   userQuit = flip handleQuit <$> newMessages
+                   newUser = getId ((\sct uid -> Client (uid,sct)) <$> newConnections)
                    greet user = do
                          putStrLn $ "User connected, user id is "++show (userId user)
                          sendMessage user $ TextMessage (greeting user)
@@ -179,7 +277,7 @@ main = do
                                    messageEvents
                                return ()
                             ) <$> userReadyEvent
-               reactimate $ broadcastMessage sendMessage <$> users <@> newMessages
+               reactimate $ execChatCommand <$> users <@> newMessages
   actuate network
   _ <- forever $ threadDelay (10*10^6)
   return ()
