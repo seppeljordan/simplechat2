@@ -4,6 +4,7 @@ import qualified Control.Event.Handler as Handler
 import Control.Monad hiding
     ( mapM_ )
 import Data.Foldable
+import Data.Maybe
 import Data.Monoid
 import Network.Socket
 import Prelude hiding
@@ -27,6 +28,7 @@ data Cmd = CmdQuit
          | CmdHelp
          | CmdBroadcast String
          | CmdWho
+         | CmdRename String
          | CmdError
 
 -- | This class modells data that is associated with a user.
@@ -41,9 +43,11 @@ instance User Client where
 
 class Named a where
     name :: a -> String
+    rename :: String -> a -> a
 
 instance Named Client where
     name (Client (_,n,_)) = n
+    rename newName (Client (uid,_,sock)) = Client (uid,newName,sock)
 
 class Message a where
     messageText :: a -> String
@@ -89,19 +93,22 @@ instance EventSource EvHandler where
         fromAddHandler addHandler
 
 class ChatCommand a where
-    isQuit :: a -> Bool
     getBroadcastMessage :: a -> Maybe String
     getDirectionalMessage :: a -> Maybe (Integer, String)
+    getRenameText :: a -> Maybe String
+    isQuit :: a -> Bool
     isHelp :: a -> Bool
     isError :: a -> Bool
     isWho :: a -> Bool
 
 instance ChatCommand Cmd where
-    isQuit CmdQuit = True
-    isQuit _ = False
     getBroadcastMessage (CmdBroadcast s) = Just s
     getBroadcastMessage _ = Nothing
     getDirectionalMessage _ = Nothing
+    getRenameText (CmdRename s) = Just s
+    getRenameText _ = Nothing
+    isQuit CmdQuit = True
+    isQuit _ = False
     isHelp CmdHelp = True
     isHelp _ = False
     isError CmdError = True
@@ -112,6 +119,7 @@ instance ChatCommand Cmd where
 instance ChatCommand TextMessage where
     getBroadcastMessage (TextMessage s) = getBroadcastMessage $ parseCmd s
     getDirectionalMessage (TextMessage s) = getDirectionalMessage $ parseCmd s
+    getRenameText (TextMessage s) = getRenameText $ parseCmd s
     isHelp (TextMessage s) = isHelp $ parseCmd s
     isError (TextMessage s) = isError $ parseCmd s
     isQuit (TextMessage s) = isQuit $ parseCmd s
@@ -120,6 +128,7 @@ instance ChatCommand TextMessage where
 instance ChatCommand SentMessage where
     getBroadcastMessage (SentMessage (_,s)) = getBroadcastMessage $ parseCmd s
     getDirectionalMessage (SentMessage (_,s)) = getDirectionalMessage $ parseCmd s
+    getRenameText (SentMessage (_,s)) = getRenameText $ parseCmd s
     isHelp (SentMessage (_,s)) = isHelp $ parseCmd s
     isError (SentMessage (_,s)) = isError $ parseCmd s
     isQuit (SentMessage (_,s)) = isQuit $ parseCmd s
@@ -140,10 +149,18 @@ instance Forceable SentMessage where
 instance Forceable Client where
     force (Client (uid,n,sock)) = uid `seq` n `seq` sock `seq` ()
 
+isBroadcast :: (ChatCommand c) =>
+                      c -> Bool
+isBroadcast cmd = isJust (getBroadcastMessage cmd)
+
+isRename :: (ChatCommand c) =>
+            c -> Bool
+isRename cmd = isJust (getRenameText cmd)
+
 parseCmd :: String -> Cmd
 parseCmd text =
     case parse ( do res <- eventually command `alternative` broadcast
-                    _ <- Text.Parsec.many anyChar
+                    _ <- clearRest
                     return res
                ) "" text of
       Left _ -> CmdError
@@ -155,10 +172,20 @@ parseCmd text =
                      rest <- Text.Parsec.many anyChar
                      return (CmdBroadcast (beginChar:rest))
       command = char '/' >>
-                ( eventually quit `alternative` eventually help `alternative` who )
+                ( eventually quit `alternative`
+                  eventually help `alternative`
+                  eventually who `alternative`
+                  renameCmd
+                )
       help = string "help" >> return CmdHelp
       quit = string "quit" >> return CmdQuit
       who = string "who" >> return CmdWho
+      renameCmd = string "rename" >>
+                  char ' ' >>
+                  Text.Parsec.many alphaNum >>= \newName ->
+                  clearRest >>
+                  return (CmdRename newName)
+      clearRest = Text.Parsec.many anyChar
 
 helpText :: String
 helpText =
@@ -166,6 +193,7 @@ helpText =
             , "\t/help: Show this message"
             , "\t/quit: Quit this program"
             , "\t/who: Show who is online"
+            , "\t/rename NICK: Change name to NICK"
             ]
 
 -- | Execute the corresponding io action to a chat command.
@@ -175,14 +203,24 @@ execChatCommand :: ( ChatCommand c, User c
                    f u -> c -> IO ()
 execChatCommand users chatCmd = do
   when (isHelp chatCmd) (sendMessage messageSock (TextMessage $ helpText))
+  when (isWho chatCmd) (sendMessage messageSock (TextMessage $ who users))
+  when (isRename chatCmd) (do broadcastMessage
+                                sendMessage
+                                users
+                                (SentMessage ( userId chatCmd
+                                             , show (userId chatCmd)++" -> "++newName++"\n"
+                                             )
+                                )
+                              sendMessage messageSock (TextMessage $ "Renamed to "++newName++"\n")
+                          )
+  when (isBroadcast chatCmd) ( case getBroadcastMessage chatCmd of
+                                 Nothing -> return ()
+                                 Just s -> broadcastMessage sendMessage users (SentMessage (userId chatCmd,s))
+                             )
   when (isQuit chatCmd) (do sendMessage messageSock $ TextMessage "Goodbye :)\n"
                             disconnect messageSock
                             putStrLn $ "User "++show (userId chatCmd)++" disconnected"
                         )
-  when (isWho chatCmd) (sendMessage messageSock (TextMessage $ who users))
-  case getBroadcastMessage chatCmd of
-    Nothing -> return ()
-    Just s -> broadcastMessage sendMessage users (SentMessage (userId chatCmd,s))
   where messageSock =
             maybe
             (error "execChatCommand: cannot associate message with any user")
@@ -193,10 +231,11 @@ execChatCommand users chatCmd = do
             (\s user -> s ++ show (userId user) ++ "\t" ++ (name user) ++ "\n")
             "ID\tNAME\n"
             xs
+        newName = maybe "<incognito>" id (getRenameText chatCmd)
 
 -- | Delete a user from the userlist when they disconnect.
 handleQuit :: ( ChatCommand c, User c
-              , User u, NetworkTarget u
+              , User u
               , Foldable f, Monoid (f u), Applicative f) =>
               f u -> c -> f u
 handleQuit users cmd
@@ -208,6 +247,17 @@ handleQuit users cmd
         mempty
         users
     | otherwise = users
+
+handleRename :: ( ChatCommand c, User c
+                , User u, Named u
+                , Functor f ) =>
+                c -> f u -> f u
+handleRename cmd users
+    | isRename cmd = (\user -> if userId user == userId cmd
+                               then rename newName user
+                               else user) <$> users
+    | otherwise = users
+    where newName = maybe "<incognito>" id (getRenameText cmd)
 
 -- | Broadcast a message to every user except the "owner" of the
 -- message.  This method calls asynchronous threads.
@@ -295,15 +345,15 @@ main = do
                userReadyEvent <- getEvents userReady
                newMessages <- getEvents messageEvents
                let -- Behavior
-                   users = accumB [] ( unions [ userAdd
-                                              , userQuit
+                   users = accumB [] ( unions [ (:) <$> newUser
+                                              , flip handleQuit <$> quittingUser
+                                              , handleRename <$> userRename
                                               ]
                                      )
                    -- Events
-                   userAdd = (:) <$> newUser
-                   userQuit = flip handleQuit <$> quittingUser
-                   quittingUser = filterE isQuit newMessages
                    newUser = getId ((\sct uid -> Client (uid,"<incognito>",sct)) <$> newConnections)
+                   userRename = filterE isRename newMessages
+                   quittingUser = filterE isQuit newMessages
                    commandErrors = filterE isError newMessages
                    -- Functions
                    greet user = do
