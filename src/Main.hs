@@ -6,6 +6,7 @@ import Control.Monad hiding
 import Data.Foldable
 import Data.Maybe
 import Data.Monoid
+import Network.SimpleChat.Classes
 import Network.Socket
 import Prelude hiding
     ( mapM_
@@ -20,6 +21,9 @@ newtype SentMessage = SentMessage (Integer, String)
 
 newtype Client = Client (Integer, String, Socket)
 
+clientSocket :: Client -> Socket
+clientSocket (Client (_,_,s)) = s
+
 newtype EvHandler a = EvHandler (Handler.AddHandler a, Handler.Handler a)
 
 newtype TextMessage = TextMessage String
@@ -31,26 +35,15 @@ data Cmd = CmdQuit
          | CmdRename String
          | CmdError
 
--- | This class modells data that is associated with a user.
-class User a where
-    userId :: a -> Integer
-
 instance User SentMessage where
     userId (SentMessage (uid,_)) = uid
 
 instance User Client where
     userId (Client (uid, _, _)) = uid
 
-class Named a where
-    name :: a -> String
-    rename :: String -> a -> a
-
 instance Named Client where
     name (Client (_,n,_)) = n
     rename newName (Client (uid,_,sock)) = Client (uid,newName,sock)
-
-class Message a where
-    messageText :: a -> String
 
 instance Message SentMessage where
     messageText (SentMessage (_,text)) = text
@@ -58,48 +51,19 @@ instance Message SentMessage where
 instance Message TextMessage where
     messageText (TextMessage s) = s
 
--- | This class modells data that is associated with a socket.  You
--- can use this for example to modell a user that is connected on a
--- specific socket.
-class NetworkTarget a where
-    targetSocket :: a -> Socket
-
 instance NetworkTarget Client where
-    targetSocket (Client (_,_,s)) = s
-
-instance NetworkTarget Socket where
-    targetSocket = id
-
-class EventHandler a where
-    newEventHandler :: IO (a b)
-    -- | Runs all registered IO actions
-    fire :: a b -> b -> IO ()
-    -- | This function registers an IO action that is executed when
-    -- the handler is fired.  The returned function should unregister
-    -- the formerly registered function
-    register :: a b -> (b -> IO ()) -> IO (IO ())
+    disconnect cl = disconnect (clientSocket cl)
+    sendString cl = sendString (clientSocket cl)
+    readLine cl = readLine (clientSocket cl)
 
 instance EventHandler EvHandler where
     newEventHandler = EvHandler <$> Handler.newAddHandler
     fire (EvHandler (_,trigger)) x = trigger x
     register (EvHandler (addHandle, _)) action = Handler.register addHandle action
 
-class EventSource a where
-    getEvents :: (Frameworks t) =>
-                 a b -> Moment t (Event t b)
-
 instance EventSource EvHandler where
     getEvents (EvHandler (addHandler,_)) =
         fromAddHandler addHandler
-
-class ChatCommand a where
-    getBroadcastMessage :: a -> Maybe String
-    getDirectionalMessage :: a -> Maybe (Integer, String)
-    getRenameText :: a -> Maybe String
-    isQuit :: a -> Bool
-    isHelp :: a -> Bool
-    isError :: a -> Bool
-    isWho :: a -> Bool
 
 instance ChatCommand Cmd where
     getBroadcastMessage (CmdBroadcast s) = Just s
@@ -134,28 +98,11 @@ instance ChatCommand SentMessage where
     isQuit (SentMessage (_,s)) = isQuit $ parseCmd s
     isWho (SentMessage (_,s)) = isWho $ parseCmd s
 
--- | This class modells data that can be force to evaluate
--- (strictness).
-class Forceable a where
-    force :: a -> ()
-
-instance Forceable a => Forceable [a] where
-    force [] = ()
-    force (x:xs) = force x `seq` force xs
-
 instance Forceable SentMessage where
     force (SentMessage (uid,m)) = uid `seq` m `seq` ()
 
 instance Forceable Client where
     force (Client (uid,n,sock)) = uid `seq` n `seq` sock `seq` ()
-
-isBroadcast :: (ChatCommand c) =>
-                      c -> Bool
-isBroadcast cmd = isJust (getBroadcastMessage cmd)
-
-isRename :: (ChatCommand c) =>
-            c -> Bool
-isRename cmd = isJust (getRenameText cmd)
 
 parseCmd :: String -> Cmd
 parseCmd text =
@@ -184,7 +131,9 @@ parseCmd text =
                   char ' ' >>
                   Text.Parsec.many alphaNum >>= \newName ->
                   clearRest >>
-                  return (CmdRename newName)
+                  if null newName
+                  then return CmdError
+                  else return (CmdRename newName)
       clearRest = Text.Parsec.many anyChar
 
 helpText :: String
@@ -202,8 +151,8 @@ execChatCommand :: ( ChatCommand c, User c
                    , Foldable f) =>
                    f u -> c -> IO ()
 execChatCommand users chatCmd = do
-  when (isHelp chatCmd) (sendMessage messageSock (TextMessage $ helpText))
-  when (isWho chatCmd) (sendMessage messageSock (TextMessage $ who users))
+  when (isHelp chatCmd) (sendMessage originalUser (TextMessage $ helpText))
+  when (isWho chatCmd) (sendMessage originalUser (TextMessage $ who users))
   when (isRename chatCmd) (do broadcastMessage
                                 sendMessage
                                 users
@@ -211,20 +160,20 @@ execChatCommand users chatCmd = do
                                              , show (userId chatCmd)++" -> "++newName++"\n"
                                              )
                                 )
-                              sendMessage messageSock (TextMessage $ "Renamed to "++newName++"\n")
+                              sendMessage originalUser (TextMessage $ "Renamed to "++newName++"\n")
                           )
   when (isBroadcast chatCmd) ( case getBroadcastMessage chatCmd of
                                  Nothing -> return ()
                                  Just s -> broadcastMessage sendMessage users (SentMessage (userId chatCmd,s))
                              )
-  when (isQuit chatCmd) (do sendMessage messageSock $ TextMessage "Goodbye :)\n"
-                            disconnect messageSock
+  when (isQuit chatCmd) (do sendMessage originalUser $ TextMessage "Goodbye :)\n"
+                            disconnect originalUser
                             putStrLn $ "User "++show (userId chatCmd)++" disconnected"
                         )
-  where messageSock =
+  where originalUser =
             maybe
             (error "execChatCommand: cannot associate message with any user")
-            targetSocket
+            id
             (find (\x -> userId x == userId chatCmd) users)
         who xs =
             foldl
@@ -279,29 +228,18 @@ sendMessage :: (NetworkTarget s, Message m) =>
 sendMessage target message = do
   go text
   where text = messageText message
-        sock = targetSocket target
         transmit :: String -> IO Int
-        transmit = send sock
+        transmit = sendString target
         go s = if null s
                then return ()
                else do bytesSent <- transmit s
                        go (drop bytesSent s)
 
-
-readN :: (NetworkTarget u) =>
-         Int -> u -> IO String
-readN n user = recv (targetSocket user) n
-
-disconnect :: (NetworkTarget u) =>
-              u -> IO ()
-disconnect user =
-    close (targetSocket user)
-
 -- | Poll a listening socket for new connections and trigger an event
 -- handler when a connection occurs.
-runSocketHandler :: (EventHandler h, NetworkTarget a) =>
-                    a -> (Socket -> IO b) -> h b -> IO ThreadId
-runSocketHandler target f handler = do
+runSocketHandler :: (EventHandler h) =>
+                    Socket -> (Socket -> IO b) -> h b -> IO ThreadId
+runSocketHandler sock f handler = do
   ok <- isListening sock
   when (not ok) (fail "runSocketHandler: socket not listening")
   forkIO $ go sock
@@ -312,7 +250,6 @@ runSocketHandler target f handler = do
       go listenSock = do (s,_) <- accept listenSock
                          f s >>= fire handler
                          go listenSock
-      sock = targetSocket target
 
 -- | Execute a IO action and issue a callback, when the action was
 -- performed.  This prcedure spawnes an asyncronous computation that
@@ -366,7 +303,7 @@ main = do
                                , "Happy Chatting"
                                ]
                    getMessage user = do
-                         msg <- readN 100 user
+                         msg <- readLine user
                          return (SentMessage (userId user, msg))
                reactimate $ greet <$> newUser
                reactimate $ (\user -> do
@@ -384,7 +321,6 @@ main = do
                                        show (userId leavingUser) ++" has left the chat\n")
                                  (filter (\targ -> userId targ /= userId leavingUser) targets)
                             ) <$> users <@> quittingUser
---               reactimate $ (putStr.messageText) <$> newMessages
                reactimate $ (\curUsers message ->
                                  case find (\user -> userId user == userId message) curUsers of
                                    Just x -> sendMessage
