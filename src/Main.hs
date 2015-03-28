@@ -1,12 +1,18 @@
+-- | Prototype implementation of a chat server.
+module Main ( main )
+
+where
+
 import Control.Concurrent
 import Control.Concurrent.Async
-import qualified Control.Event.Handler as Handler
 import Control.Monad hiding
     ( mapM_ )
 import Data.Foldable
 import Data.Maybe
 import Data.Monoid
+import Network.SimpleChat.Callback
 import Network.SimpleChat.Classes
+import Network.SimpleChat.Message
 import Network.Socket
 import Prelude hiding
     ( mapM_
@@ -15,7 +21,7 @@ import Prelude hiding
 import Reactive.Banana
 import Reactive.Banana.Frameworks hiding
     ( register )
-import Text.Parsec
+import Control.Exception
 
 newtype SentMessage = SentMessage (Integer, String)
 
@@ -23,17 +29,6 @@ newtype Client = Client (Integer, String, Socket)
 
 clientSocket :: Client -> Socket
 clientSocket (Client (_,_,s)) = s
-
-newtype EvHandler a = EvHandler (Handler.AddHandler a, Handler.Handler a)
-
-newtype TextMessage = TextMessage String
-
-data Cmd = CmdQuit
-         | CmdHelp
-         | CmdBroadcast String
-         | CmdWho
-         | CmdRename String
-         | CmdError
 
 instance User SentMessage where
     userId (SentMessage (uid,_)) = uid
@@ -48,46 +43,10 @@ instance Named Client where
 instance Message SentMessage where
     messageText (SentMessage (_,text)) = text
 
-instance Message TextMessage where
-    messageText (TextMessage s) = s
-
 instance NetworkTarget Client where
     disconnect cl = disconnect (clientSocket cl)
     sendString cl = sendString (clientSocket cl)
-    readLine cl = readLine (clientSocket cl)
-
-instance EventHandler EvHandler where
-    newEventHandler = EvHandler <$> Handler.newAddHandler
-    fire (EvHandler (_,trigger)) x = trigger x
-    register (EvHandler (addHandle, _)) action = Handler.register addHandle action
-
-instance EventSource EvHandler where
-    getEvents (EvHandler (addHandler,_)) =
-        fromAddHandler addHandler
-
-instance ChatCommand Cmd where
-    getBroadcastMessage (CmdBroadcast s) = Just s
-    getBroadcastMessage _ = Nothing
-    getDirectionalMessage _ = Nothing
-    getRenameText (CmdRename s) = Just s
-    getRenameText _ = Nothing
-    isQuit CmdQuit = True
-    isQuit _ = False
-    isHelp CmdHelp = True
-    isHelp _ = False
-    isError CmdError = True
-    isError _ = False
-    isWho CmdWho = True
-    isWho _ = False
-
-instance ChatCommand TextMessage where
-    getBroadcastMessage (TextMessage s) = getBroadcastMessage $ parseCmd s
-    getDirectionalMessage (TextMessage s) = getDirectionalMessage $ parseCmd s
-    getRenameText (TextMessage s) = getRenameText $ parseCmd s
-    isHelp (TextMessage s) = isHelp $ parseCmd s
-    isError (TextMessage s) = isError $ parseCmd s
-    isQuit (TextMessage s) = isQuit $ parseCmd s
-    isWho (TextMessage s) = isWho $ parseCmd s
+    readString cl = readString (clientSocket cl)
 
 instance ChatCommand SentMessage where
     getBroadcastMessage (SentMessage (_,s)) = getBroadcastMessage $ parseCmd s
@@ -103,38 +62,6 @@ instance Forceable SentMessage where
 
 instance Forceable Client where
     force (Client (uid,n,sock)) = uid `seq` n `seq` sock `seq` ()
-
-parseCmd :: String -> Cmd
-parseCmd text =
-    case parse ( do res <- eventually command `alternative` broadcast
-                    _ <- clearRest
-                    return res
-               ) "" text of
-      Left _ -> CmdError
-      Right x -> x
-    where
-      alternative = (Text.Parsec.<|>)
-      eventually = Text.Parsec.try
-      broadcast = do beginChar <- noneOf "/"
-                     rest <- Text.Parsec.many anyChar
-                     return (CmdBroadcast (beginChar:rest))
-      command = char '/' >>
-                ( eventually quit `alternative`
-                  eventually help `alternative`
-                  eventually who `alternative`
-                  renameCmd
-                )
-      help = string "help" >> return CmdHelp
-      quit = string "quit" >> return CmdQuit
-      who = string "who" >> return CmdWho
-      renameCmd = string "rename" >>
-                  char ' ' >>
-                  Text.Parsec.many alphaNum >>= \newName ->
-                  clearRest >>
-                  if null newName
-                  then return CmdError
-                  else return (CmdRename newName)
-      clearRest = Text.Parsec.many anyChar
 
 helpText :: String
 helpText =
@@ -244,29 +171,19 @@ runSocketHandler sock f handler = do
   when (not ok) (fail "runSocketHandler: socket not listening")
   forkIO $ go sock
     where
-      -- | accept a connection on a socket, fire the event handler and
+      -- accept a connection on a socket, fire the event handler and
       -- continue with listening on the socket.
       go :: Socket -> IO ()
       go listenSock = do (s,_) <- accept listenSock
                          f s >>= fire handler
                          go listenSock
 
--- | Execute a IO action and issue a callback, when the action was
--- performed.  This prcedure spawnes an asyncronous computation that
--- is only blocking in case of unsafe calls.
-withCallbackDo :: (EventHandler h, Forceable b, Forceable u) =>
-                  u -> (u -> IO b) -> h u -> h b -> IO (Async ())
-withCallbackDo user action userReady resultReady =
-    async ( do result <- force user `seq` action user
-               fire resultReady result
-               fire userReady user
-          )
-
 getId :: Event t (Integer -> a) -> Event t a
 getId ev =
     let curId = accumB 0 ( (+1) <$ ev )
     in flip ($) <$> curId <@> ev
 
+-- | Start a prototype implementation of a chat server.
 main :: IO ()
 main = do
   sock <- socket AF_INET Stream defaultProtocol
@@ -281,7 +198,7 @@ main = do
                newConnections <- getEvents connectEvents
                userReadyEvent <- getEvents userReady
                newMessages <- getEvents messageEvents
-               let -- Behavior
+               let -- Behaviors
                    users = accumB [] ( unions [ (:) <$> newUser
                                               , flip handleQuit <$> quittingUser
                                               , handleRename <$> userRename
@@ -303,24 +220,29 @@ main = do
                                , "Happy Chatting"
                                ]
                    getMessage user = do
-                         msg <- readLine user
+                         msg <- readString user
                          return (SentMessage (userId user, msg))
+               -- Output
                reactimate $ greet <$> newUser
+               -- Wait for more input when a user is ready.
                reactimate $ (\user -> do
                                _ <- withCallbackDo
                                     user
-                                    getMessage
+                                    (\u -> bracket (getMessage u) (const $ fire userReady u) return)
                                     userReady
                                     messageEvents
                                return ()
                             ) <$> userReadyEvent
+               -- process chat commands that require IO
                reactimate $ execChatCommand <$> users <@> newMessages
+               -- broadcast that a user has left
                reactimate $ (\targets leavingUser ->
                                  mapM_
                                  (flip sendMessage $ TextMessage $
                                        show (userId leavingUser) ++" has left the chat\n")
                                  (filter (\targ -> userId targ /= userId leavingUser) targets)
                             ) <$> users <@> quittingUser
+               -- process input errors by clients
                reactimate $ (\curUsers message ->
                                  case find (\user -> userId user == userId message) curUsers of
                                    Just x -> sendMessage

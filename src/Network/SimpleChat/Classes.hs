@@ -5,16 +5,22 @@
 -- not restricting ourselves to one specific implementation of our
 -- data types.
 module Network.SimpleChat.Classes
-    ( User (..)
+    ( -- * Non-IO
+      User (..)
     , Message (..)
     , Named (..)
-    , NetworkTarget (..)
-    , EventHandler (..)
-    , EventSource (..)
+    , Forceable (..)
+    , RenderChar (..)
+    , (<|), (|>)
     , ChatCommand (..)
     , isBroadcast
     , isRename
-    , Forceable (..)
+    -- * IO
+    , CreationTime (..)
+    , NetworkTarget (..)
+    , EventHandler (..)
+    , EventSource (..)
+    , InputSource (..)
     )
 where
 
@@ -25,13 +31,18 @@ import Reactive.Banana
 import Reactive.Banana.Frameworks
 import qualified Data.ByteString.Char8 as S
 import qualified Data.ByteString.Lazy.Char8 as L
+import qualified Data.Sequence as Seq
+import System.IO
+import Data.Foldable
+import Data.Monoid
+import Data.Time
 
 -- | This class modells data that is associated with a user.
 class User a where
     -- | Return the assigned user id
     userId :: a -> Integer
 
--- | Modell a structure that has a name.              
+-- | Modell a structure that has a name.
 class Named a where
     -- | query the name of an structure
     name :: a -> String
@@ -49,33 +60,28 @@ class NetworkTarget a where
     -- | Close the connection to a target
     disconnect :: a -> IO ()
     -- | read characters from a target
-    readLine :: a -> IO String
+    readString :: a -> IO String
     -- | send a string to the target.  The function should return how
     -- many characters were really send.
     sendString :: a -> String -> IO Int
 
 instance NetworkTarget Socket where
     disconnect s = close s
-    readLine sock =
-        go ""
-        where go str = do
-                answer <- recv sock 1
-                if answer == "\n"
-                then return (str ++ answer)
-                else go (str++answer)
+    readString sock =
+        recv sock 256
     sendString = send
 
 instance NetworkTarget TLS.Context where
     disconnect cont = do
       TLS.bye cont
       TLS.contextClose cont
-    readLine cont =
+    readString cont =
         S.unpack <$> TLS.recvData cont
     sendString cont msg = do
         TLS.sendData cont (L.pack msg)
         return (length msg)
 
--- | Modell a structure that can register callback functions.                 
+-- | Modell a structure that can register callback functions.
 class EventHandler a where
     newEventHandler :: IO (a b)
     -- | Runs all registered IO actions
@@ -120,3 +126,43 @@ class Forceable a where
 instance Forceable a => Forceable [a] where
     force [] = ()
     force (x:xs) = force x `seq` force xs
+
+-- | Modells a structure that can be displayed in a list of string.
+class RenderChar a where
+    renderChar :: a -> [String]
+
+-- | Modells a source of character input.
+class InputSource a where
+    inputChar :: a -> IO Char
+    -- | The predefined implementation of `inputLine` will ask for one
+    -- character at a time and check if it got a new line character.
+    -- If you need a more efficient implementation (you probably do)
+    -- you should implement it yourself.
+    inputLine :: a -> IO String
+    inputLine h =
+        go Seq.empty
+        where go xs = do x <- inputChar h
+                         if x == '\n'
+                         then return $ toList xs
+                         else go (xs Seq.|> x)
+
+instance InputSource Handle where
+    inputChar = hGetChar
+    inputLine = hGetLine
+
+instance InputSource Socket where
+    inputChar s = head <$> (recv s 1)
+
+-- | Add a singleton to the right side of a monoid
+(|>) :: (Applicative d, Monoid (d a)) =>
+        d a -> a -> d a
+(|>) deque single = deque <> pure single
+
+-- | Add a singleton to the left side of a monoid
+(<|) :: (Applicative d, Monoid (d a)) =>
+        a -> d a -> d a
+(<|) single deque = pure single <> deque
+
+-- | Modell an object that carries a creation time.
+class CreationTime a where
+    creationTime :: a -> UTCTime
