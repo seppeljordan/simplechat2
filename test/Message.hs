@@ -1,46 +1,37 @@
 module Main where
 
-import Control.Monad
 import Network.SimpleChat.Classes
 import Network.SimpleChat.Message
-import System.Exit (exitFailure, exitSuccess)
 import Test.HUnit
+import TestUtils
 
-assertTrue = assertBool
-assertFalse msg = assertTrue msg.not
+test_quit f = TestCase (do assertTrue "/quit should be a quit command" (isQuit (f "/quit"))
+                           assertFalse "blabla shoud not be a quit command" (isQuit (f "blabla"))
+                       )
 
-test_quit const = TestCase (do assertTrue "/quit should be a quit command" (isQuit (const "/quit"))
-                               assertFalse "blabla shoud not be a quit command" (isQuit (const "blabla"))
-                           )
+test_error f = TestCase ( do assertTrue "/blabla should be an error" (isError (f "/blabla"))
+                             assertFalse "blabla should not be an error" (isError (f "blabla"))
+                        )
 
-test_error const = TestCase ( do assertTrue "/blabla should be an error" (isError (const "/blabla"))
-                                 assertFalse "blabla should not be an error" (isError (const "blabla"))
-                            )
+test_help f = TestCase (assertTrue
+                        "/help should be a help command"
+                        (isHelp (f "/help"))
+                       )
 
-test_help const = TestCase (assertTrue
-                            "/help should be a help command"
-                            (isHelp (const "/help"))
-                           )
+test_who f = TestCase (assertTrue
+                       "/who should be a who command"
+                       (isWho (f "/who"))
+                      )
 
-test_who const = TestCase (assertTrue
-                           "/who should be a who command"
-                           (isWho (const "/who"))
-                          )
+test_rename f = TestCase ( do assertEqual "'/rename test' should yield the rename text 'test'"
+                                          (Just "test") (getRenameText (f "/rename test"))
+                              assertTrue "'/rename' should be an error" (isError (f "/rename"))
+                         )
 
-test_rename const = TestCase ( do assertEqual "'/rename test' should yield the rename text 'test'"
-                                              (Just "test") (getRenameText (const "/rename test"))
-                                  assertTrue "'/rename' should be an error" (isError (const "/rename"))
-                             )
+test_cmd f = TestList ( ($ f) `map` [test_quit, test_help, test_who, test_error, test_rename] )
 
-main = do result <- runTestTT cmdTests
-          when (errors result > 0) exitFailure
-          when (failures result > 0) exitFailure
-          exitSuccess
-    where cmdTests = TestList ( ($ parseCmd) `map`
-                                [ test_quit
-                                , test_help
-                                , test_who
-                                , test_error
-                                , test_rename
-                                ]
-                              )
+main = do runTest $ TestList [ cmdTests
+                             , textMessageTests
+                             ]
+    where cmdTests = test_cmd parseCmd
+          textMessageTests = test_cmd TextMessage
