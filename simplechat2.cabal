@@ -13,7 +13,7 @@ cabal-version:       >=1.10
 
 executable simpleserver
   main-is:             server.hs
-  build-depends:       base >=4.7 && <4.8,
+  build-depends:       base >=4.6 && <4.8,
                        network >=2.6 && <2.7,
                        async >= 2.0 && < 2.1,
                        reactive-banana >= 0.8 && < 0.9,
@@ -29,7 +29,7 @@ executable simpleserver
 
 executable simpleclient
   main-is:             client.hs
-  build-depends:       base >=4.7 && <4.8,
+  build-depends:       base >=4.6 && <4.8,
                        network >=2.6 && <2.7,
                        async >= 2.0 && < 2.1,
                        reactive-banana >= 0.8 && < 0.9,
