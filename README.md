@@ -1,4 +1,4 @@
-# Intrudoction
+# Introduction
 
 This is a prototype for a chat server.  It was created for educational
 purposes only.  It is strongly discouraged to use this application as
