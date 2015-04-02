@@ -8,3 +8,9 @@ an internet chat server.
 
 This program implements a network server though callbacks,
 asynchronous IO and functional reactive programming.
+
+# Nix
+
+There is a nix expression in this repository.  You can use it to
+aquire the necessary dependencies if you are using the nix package
+manager.
