@@ -12,16 +12,16 @@ import Data.Functor
 import Control.Monad
 import Reactive.Banana.Frameworks hiding (register)
 import Reactive.Banana
-import Control.Concurrent
+import System.Environment
 
 hostName :: String
 hostName = "127.0.0.1"
 
-main :: IO ()
-main = do
+runClient :: Integer -> IPv4 -> IO ()
+runClient port ipaddr = do
   putStrLn $ "Connect to "++hostName
   sock <- socket AF_INET Stream defaultProtocol
-  connect sock (SockAddrInet (fromInteger 4141) (toHostAddress (read "127.0.0.1")))
+  connect sock (SockAddrInet (fromInteger port) (toHostAddress ipaddr))
   putStrLn $ "...Connected"
   (inputHandler, inputHandlerProc) <- installInputHandler stdin :: IO (EvHandler String, ThreadId)
   (networkHandler, networkHandlerProc) <- installNetworkHandler sock :: IO (EvHandler String, ThreadId)
@@ -41,3 +41,10 @@ main = do
   disconnect sock
   putStrLn $ "... Disconnected"
   return ()
+
+main :: IO ()
+main = do
+  args <- getArgs
+  let port = read $ args !! 0
+      ipaddr = read $ args !! 1
+  runClient port ipaddr
