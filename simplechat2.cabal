@@ -24,7 +24,7 @@ library
                      , bytestring >= 0.10 && < 0.11
                      , containers >= 0.5 && < 0.6
                      , time >= 1.4 && < 1.5
-                     , iproute >= 1.3 && < 1.4
+                     , iproute >= 1.3 && < 1.5
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options: -Wall
@@ -40,7 +40,7 @@ executable simpleserver
                      , bytestring >= 0.10 && < 0.11
                      , containers >= 0.5 && < 0.6
                      , time >= 1.4 && < 1.5
-                     , iproute >= 1.3 && < 1.4
+                     , iproute >= 1.3 && < 1.5
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options: -Wall
@@ -56,7 +56,7 @@ executable simpleclient
                      , bytestring >= 0.10 && < 0.11
                      , containers >= 0.5 && < 0.6
                      , time >= 1.4 && < 1.5
-                     , iproute >= 1.3 && < 1.4
+                     , iproute >= 1.3 && < 1.5
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options: -Wall
